@@ -92,7 +92,7 @@ def findNearestTrackpoint(list, time):
     for trackpoint in list:
         # if this point is closer than the closest recorded yet
         if abs(trackpoint.time - time) < closestTime:
-            closestTime = abs(trackpoint.time - closestTime)
+            closestTime = abs(trackpoint.time - time)
             closestPoint = trackpoint
 
         # bail out early.  the trackpoint list is in chronological order...

@@ -48,6 +48,8 @@ def formatAsRational(number):
     """Format a floating point number as a rational number
        ex. 10.463 -> 10463/1000
     """
+    if number == 0:
+       return "0/1"
 
     stringrep = ('%f' % number)
     (int_portion, frac_portion) = stringrep.rstrip('0').split('.')
