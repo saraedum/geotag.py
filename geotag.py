@@ -13,7 +13,7 @@
 # Jamie Lawrence, 4th August 2006
 # Additions/modifications by Mike Pickering
 
-import re, os, EXIF, tempfile, sys
+import re, os, tempfile, sys, subprocess, traceback
 from optparse import OptionParser
 from time import strptime, mktime, strftime, gmtime
 from gpsfuncs import decToDMS, formatAsRational, Trackpoint
@@ -33,6 +33,11 @@ class Photo:
 
     pass
 
+def getExif(photo):
+    """Get the EXIF tags for a file as returned by exiv2.
+    """
+    stdout = subprocess.Popen(["exiv2","pr",photo.filename],stdout=subprocess.PIPE).communicate()[0];
+    return dict( (items[0].strip(),items[1].strip()) for items in [line.split(b':',1) for line in stdout.split(b'\n')] if len(items)==2)
 
 def getExiv2Cmd(photo):
     """Get the command string to run exiv2 on the given photo
@@ -157,10 +162,9 @@ def main():
         photo.filename = file
         photo.shortfilename = os.path.split(file)[1]
         # Parse the EXIF data and find the closest matching trackpoint
-        f = open(photo.filename, 'rb')
-        tags = EXIF.process_file(f, details=False)
+        tags = getExif(photo)
         try:
-            photo.time = mktime(strptime(str(tags['EXIF DateTimeOriginal']), "%Y:%m:%d %H:%M:%S"))
+            photo.time = mktime(strptime(bytes.decode(tags[b'Image timestamp']), "%Y:%m:%d %H:%M:%S"))
             # account for time difference (GPX uses UTC; EXIF uses local time)
             photo.time += options.timediff * 3600
             photo.trackpoint = findNearestTrackpoint(trackpoints, photo.time)
