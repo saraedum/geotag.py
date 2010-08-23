@@ -12,9 +12,11 @@
 # Author:
 # Jamie Lawrence, 4th August 2006
 # Additions/modifications by Mike Pickering
+# Interpolation, Python 3 compliance by Julian Rueth, August 2010
 
 import re, os, tempfile, sys, subprocess, traceback
-from optparse import OptionParser
+from argparse import ArgumentParser
+from math import pi, sin, cos, atan2, sqrt
 from time import strptime, mktime, strftime, gmtime
 from gpsfuncs import decToDMS, formatAsRational, Trackpoint
 from xml.dom import minidom
@@ -39,18 +41,14 @@ def getExif(photo):
     stdout = subprocess.Popen(["exiv2","pr",photo.filename],stdout=subprocess.PIPE).communicate()[0];
     return dict( (items[0].strip(),items[1].strip()) for items in [line.split(b':',1) for line in stdout.split(b'\n')] if len(items)==2)
 
-def getExiv2Cmd(photo):
-    """Get the command string to run exiv2 on the given photo
+def setExif(photo):
+    """Set the EXIF tags on this photo.
 
        photo is a Photo type containing trackpoint information and the
        filename of the .jpg file to be operated on.
 
-       The return value is a string that can be run at the command line
-       (or through os.system()) to modify the .jpg file.  In addition to
-       writing the GPSInfo EXIF tags, an EXIF comment is written with the
-       same information.  Testing has shown that writing a JPEG comment here
-       renders the .jpg file unparsable by the Python EXIF module.  If needed,
-       it could be done with wrjpgcom.
+       In addition to writing the GPSInfo EXIF tags, an EXIF comment
+       is written with the same information.
     """
 
     # poor man's ? operator
@@ -61,67 +59,100 @@ def getExiv2Cmd(photo):
     altref = (0, 1)[photo.trackpoint.ele < 0]
     alt = formatAsRational(abs(photo.trackpoint.ele))
 
-    return """exiv2 -k                                                     \
-    -M "set Exif.Photo.UserComment charset=Ascii %(trackpointstr)s"        \
-    -M "set Exif.GPSInfo.GPSVersionID 2 2 0 0"                             \
-    -M "set Exif.GPSInfo.GPSLatitudeRef %(latref)s"                        \
-    -M "set Exif.GPSInfo.GPSLatitude %(latdeg)s %(latmin)s %(latsec)s"     \
-    -M "set Exif.GPSInfo.GPSAltitudeRef %(altref)s"                        \
-    -M "set Exif.GPSInfo.GPSAltitude %(alt)s"                              \
-    -M "set Exif.GPSInfo.GPSMapDatum WGS-84"                               \
-    -M "set Exif.GPSInfo.GPSLongitudeRef %(lonref)s"                       \
-    -M "set Exif.GPSInfo.GPSLongitude %(londeg)s %(lonmin)s %(lonsec)s"    \
-     %(filename)s""" % \
-     {"trackpointstr": photo.trackpoint.getstr(),
-      "latref": latref, "latdeg": latdeg, "latmin": latmin, "latsec": latsec,
-      "lonref": lonref, "londeg": londeg, "lonmin": lonmin, "lonsec": lonsec,
-      "altref": altref, "alt": alt, "filename": photo.filename}
+    subprocess.check_call(["exiv2","-k",
+        "-M","set Exif.Photo.UserComment charset=Ascii %s"%photo.trackpoint.getstr(),
+        "-M","set Exif.GPSInfo.GPSVersionID 2 2 0 0",
+        "-M","set Exif.GPSInfo.GPSLatitudeRef %s"%latref,
+        "-M","set Exif.GPSInfo.GPSLatitude %s %s %s"%(latdeg,latmin,latsec),
+        "-M","set Exif.GPSInfo.GPSAltitudeRef %s"%altref,
+        "-M","set Exif.GPSInfo.GPSAltitude %s"%alt,
+        "-M","set Exif.GPSInfo.GPSMapDatum WGS-84",
+        "-M","set Exif.GPSInfo.GPSLongitudeRef %s"%lonref,
+        "-M","set Exif.GPSInfo.GPSLongitude %s %s %s"%(londeg,lonmin,lonsec),
+        photo.filename])
 
-
-def findNearestTrackpoint(list, time):
-    """Search the list of trackpoints, and return the one with the time nearest
-       to time
-
-       Return None if no trackpoint exists within 5 minutes
-       TODO make this time configurable
-       TODO give an option to interpolate
+def interpolate_n(deltas, values):
+    """For values[0]=f(x0), values[1]=f(x1), do linear interpolation to find f(x) with |x-x0|=deltas[0], |x-x1|=deltas[1].
     """
-    closestTime = 5 * 60  # Python datetimes are seconds
-    closestPoint = None
+    weights = []
+    for delta in deltas:
+       weights.append(delta==0);
+    if sum(weights)==0:
+        weights = [1/delta for delta in deltas]
+    return sum([value*weight for (value,weight) in zip(values,weights)])/sum(weights)
+
+def findNearestTrackpoint(list, time, interpolate, threshold):
+    """Search the list of trackpoints, and return the one with the time nearest to time possibly interpolating between closest trackpoints
+
+       Return None if no trackpoint exists within threshold seconds
+    """
+    closestPoints = [None, None] # the closest point before and after
+    closestTimes = [threshold, threshold]  # Python datetimes are seconds
     # iterate over the list (binary search would work too)
     for trackpoint in list:
+        delta = trackpoint.time - time
+        after = (delta >= 0)
         # if this point is closer than the closest recorded yet
-        if abs(trackpoint.time - time) < closestTime:
-            closestTime = abs(trackpoint.time - time)
-            closestPoint = trackpoint
+        if abs(delta) < closestTimes[after]:
+            closestTimes[after] = abs(delta)
+            closestPoints[after] = trackpoint
 
-        # bail out early.  the trackpoint list is in chronological order...
-        # if we've passed the photo's time in the track, may as well exit now
-        if trackpoint.time > time:
-            break
+    for i in [0,1]:
+        if closestPoints[i] is None: closestPoints[i] = closestPoints[1-i]
+    #if both are None then there had been no points at all and we're screwed
 
-    return closestPoint
+    #reduce the !interpolate case to the interpolate case
+    if not interpolate:
+        for i in [0,1]:
+            if abs(closestPoints[i].time - time)<=abs(closestPoints[1-i].time-time):
+                closestPoints[1-i]=closestPoints[i]
 
+    #we use normal vectors for interpolation purposes (http://en.wikipedia.org/wiki/N-vector)
+    normals = [ (cos(point.lat/90.*pi)*cos(point.lon/90.*pi),
+                cos(point.lat/90.*pi)*sin(point.lon/90.*pi),
+                sin(point.lat/90.*pi)) for point in closestPoints ]
+    deltas = [ abs(time-point.time) for point in closestPoints ]
+    #interpolate the normal vectors
+    normal = [ interpolate_n(deltas, values) for values in zip(*normals) ]
+    #normalize the result
+    normal = [ value/sum(v*v for v in normal) for value in normal ]
+    #interpolate the elevation
+    elevation = interpolate_n(deltas, (closestPoints[0].ele, closestPoints[1].ele))
+
+    #convert everything back to lat/lon coordinates
+    ret = Trackpoint(
+            atan2(normal[2],sqrt(normal[0]**2+normal[1]**2))/pi*90,
+            atan2(normal[1],normal[0])/pi*90,
+            elevation);
+    ret.time = time
+    return ret
 
 def main():
     # Parse the options
-    usage = "usage: %prog [options] [photo1 photo2 ...]"
-    parser = OptionParser(usage)
-    parser.add_option("-g", "--gps", dest="gps",
+    parser = ArgumentParser()
+    parser.add_argument("args", metavar="PHOTO", nargs='*', help='photos to be processed')
+    parser.add_argument("-g", "--gps", dest="gps", required=True,
                       help="The input GPS track file in .gpx format", metavar="FILE")
-    parser.add_option("-p", "--photos", dest="photos",
+    parser.add_argument("-p", "--photos", dest="photos",
                       help="The directory of photos", metavar="DIR")
     # MPickering added next option; this offset is added to the JPG values (which don't have
     # native timezone information)
-    parser.add_option("-t", "--timediff", dest="timediff", type="int", default=0,
+    parser.add_argument("-t", "--timediff", dest="timediff", type=int, default=0,
                       help="Add this number of hours to the JPEG times")
-    parser.add_option("-o", "--output", dest="output",
+    parser.add_argument("-o", "--output", dest="output",
                       help="The output filename for the GPX file", metavar="FILE")
-    parser.add_option("-u", "--update-photos", action="store_true",
+    parser.add_argument("-u", "--update-photos", action="store_true",
                       dest="updatephotos", help="Update the photos with GPS information")
-    parser.add_option("-v", "--verbose",
+    parser.add_argument("-v", "--verbose",
                       action="store_true", dest="verbose")  # not used; could be useful
-    (options, args) = parser.parse_args()
+    parser.add_argument("-i", "--interpolate", action="store_true", dest="interpolate",
+                      help="interpolate coordinates linearily between closest track points")
+    parser.add_argument("--threshold", dest="threshold", type=int, default=5*60,
+                      help="threshold in seconds that a track point may differ from a photos timestamp still allowing them to get associated; set to -1 to allow arbitrary threshold.")
+    options = parser.parse_args()
+    args = options.args
+
+    if options.threshold==-1: options.threshold = float("inf")
 
     # Load and Parse the GPX file to retrieve all the trackpoints
     xmldoc = minidom.parse(options.gps)
@@ -167,12 +198,12 @@ def main():
             photo.time = mktime(strptime(bytes.decode(tags[b'Image timestamp']), "%Y:%m:%d %H:%M:%S"))
             # account for time difference (GPX uses UTC; EXIF uses local time)
             photo.time += options.timediff * 3600
-            photo.trackpoint = findNearestTrackpoint(trackpoints, photo.time)
+            photo.trackpoint = findNearestTrackpoint(trackpoints, photo.time, options.interpolate, options.threshold)
             if photo.trackpoint:
                 photos.append(photo)
-        except e:
+        except:
             # picture may have been unreadable, may not have had timestamp, etc.
-            print photo.filename, e.value
+            print(photo.filename, traceback.format_exc())
 
 
     # ready to output the photo listing
@@ -246,7 +277,7 @@ def main():
 
         # now, assemble and execute the exiv2 command
         if options.updatephotos:
-            os.system(getExiv2Cmd(photo))
+            setExif(photo);
 
     # finish the bounds element
     bounds_element.setAttribute("minlat", str(minlat))
